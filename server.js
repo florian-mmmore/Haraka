@@ -4,10 +4,12 @@
 const cluster = require('node:cluster')
 const { spawn } = require('node:child_process')
 const fs = require('node:fs')
+const net = require('node:net')
 const os = require('node:os')
 const path = require('node:path')
 const tls = require('node:tls')
 const constants = require('haraka-constants')
+const net_utils = require('haraka-net-utils')
 
 const tls_socket = require('./tls_socket')
 const conn = require('./connection')
@@ -64,8 +66,16 @@ Server.load_http_ini = () => {
     }).main
 }
 
+Server.load_connection_ini = () => {
+    Server.connection = {}
+    Server.connection.cfg = Server.config.get('connection.ini', {
+        booleans: ['+haproxy.enabled'],
+    })
+}
+
 Server.load_smtp_ini()
 Server.load_http_ini()
+Server.load_connection_ini()
 
 Server.daemonize = function () {
     const c = this.cfg.main
@@ -351,6 +361,142 @@ Server.load_default_tls_config = (done) => {
     })
 }
 
+Server.create_smtps_server = (opts, onConnect) => {
+    let server
+    const socket_tls_state = new Map()
+    const proxyPrefix = Buffer.from('PROXY ')
+    // Defensive cap while waiting for a PROXY v1 line before TLS starts.
+    const proxyLineReadLimit = 512
+
+    const tlsServer = tls.createServer(opts, (cleartext) => {
+        const state_key = socket_tls_state_key(cleartext)
+        const smtps_state = socket_tls_state.get(state_key)
+        if (smtps_state) cleartext.haraka_smtps = smtps_state
+        socket_tls_state.delete(state_key)
+
+        onConnect(cleartext)
+    })
+
+    function close_with_proxy_error(socket, timer, msg) {
+        clearTimeout(timer)
+        socket.removeAllListeners('data')
+        socket.end(`421 ${msg}\r\n`, () => {
+            socket.destroy()
+        })
+    }
+
+    function socket_tls_state_key(socket) {
+        return JSON.stringify([socket.remoteAddress, socket.remotePort, socket.localAddress, socket.localPort])
+    }
+
+    function start_tls(socket, proxy, peer_allowed) {
+        if (proxy || peer_allowed) {
+            const smtps_state = { peer_allowed }
+            if (proxy) {
+                smtps_state.proxy = {
+                    ...proxy,
+                    proxy_ip: net_utils.normalize_ip(socket.remoteAddress) || socket.remoteAddress,
+                }
+            }
+            socket_tls_state.set(socket_tls_state_key(socket), smtps_state)
+        }
+
+        tlsServer.emit('connection', socket)
+    }
+
+    tlsServer.on('tlsClientError', (err, cleartext) => {
+        if (cleartext) socket_tls_state.delete(socket_tls_state_key(cleartext))
+        server.emit('tlsClientError', err, cleartext)
+    })
+
+    tlsServer.on('secureConnection', (cleartext) => {
+        server.emit('secureConnection', cleartext)
+    })
+
+    function starts_with_proxy_prefix(data) {
+        if (!data.length) return true
+        if (data.length > proxyPrefix.length) return data.subarray(0, proxyPrefix.length).equals(proxyPrefix)
+
+        return proxyPrefix.subarray(0, data.length).equals(data)
+    }
+
+    function start_tls_with_buffer(socket, data, proxy, peer_allowed) {
+        // Preserve bytes already read by the PROXY pre-parser, then hand the
+        // paused socket to TLS before letting it read again.
+        socket.pause()
+        if (data?.length) socket.unshift(data)
+        setImmediate(() => {
+            start_tls(socket, proxy, peer_allowed)
+            socket.resume()
+        })
+    }
+
+    server = net.createServer((socket) => {
+        const remote_ip = net_utils.normalize_ip(socket.remoteAddress) || socket.remoteAddress
+
+        if (!net_utils.is_haproxy_allowed(remote_ip)) {
+            start_tls(socket)
+            return
+        }
+
+        let current_data = null
+        const proxy_timer = setTimeout(() => {
+            close_with_proxy_error(socket, proxy_timer, 'PROXY timeout')
+        }, 30 * 1000)
+
+        function cleanup() {
+            clearTimeout(proxy_timer)
+            // Stop flowing before removing the pre-parser listener so TLS bytes
+            // cannot arrive between listener removal and TLS attachment.
+            socket.pause()
+            socket.removeListener('data', on_data)
+            socket.removeListener('close', cleanup)
+            socket.removeListener('error', cleanup)
+        }
+
+        function on_data(data) {
+            current_data = current_data ? Buffer.concat([current_data, data]) : data
+
+            if (!starts_with_proxy_prefix(current_data)) {
+                cleanup()
+                start_tls_with_buffer(socket, current_data, null, true)
+                return
+            }
+
+            const offset = current_data.indexOf(0x0a)
+            if (offset === -1) {
+                if (current_data.length > proxyLineReadLimit) {
+                    close_with_proxy_error(socket, proxy_timer, 'Invalid PROXY format')
+                }
+                return
+            }
+            if (offset > proxyLineReadLimit) {
+                close_with_proxy_error(socket, proxy_timer, 'Invalid PROXY format')
+                return
+            }
+
+            cleanup()
+
+            const proxy = net_utils.parse_proxy_line(current_data.slice(0, offset + 1))
+            if (!proxy) {
+                close_with_proxy_error(socket, proxy_timer, 'Invalid PROXY format')
+                return
+            }
+
+            const rest = current_data.slice(offset + 1)
+            start_tls_with_buffer(socket, rest, proxy, true)
+        }
+
+        socket.once('close', cleanup)
+        socket.once('error', cleanup)
+        socket.on('data', on_data)
+    })
+
+    server.tlsServer = tlsServer
+
+    return server
+}
+
 Server.get_smtp_server = async (ep, inactivity_timeout) => {
     let server
 
@@ -358,17 +504,19 @@ Server.get_smtp_server = async (ep, inactivity_timeout) => {
         client.setTimeout(inactivity_timeout)
         const connection = conn.createConnection(client, server, Server.cfg)
 
-        if (!server.has_tls) return
+        if (server.has_tls) {
+            const cipher = client.getCipher()
+            cipher.version = client.getProtocol() // replace min with actual
 
-        const cipher = client.getCipher()
-        cipher.version = client.getProtocol() // replace min with actual
+            connection.setTLS({
+                cipher,
+                verified: client.authorized,
+                verifyError: client.authorizationError,
+                peerCertificate: client.getPeerCertificate(),
+            })
+        }
 
-        connection.setTLS({
-            cipher,
-            verified: client.authorized,
-            verifyError: client.authorizationError,
-            peerCertificate: client.getPeerCertificate(),
-        })
+        if (client.haraka_smtps?.proxy) connection.apply_proxy(client.haraka_smtps.proxy)
     }
 
     if (ep.port === parseInt(Server.cfg.main.smtps_port, 10)) {
@@ -382,10 +530,13 @@ Server.get_smtp_server = async (ep, inactivity_timeout) => {
             tls_socket.cfg.main.requireAuthorized,
         )
 
-        server = tls.createServer(opts, onConnect)
-        tls_socket.addOCSP(server)
+        server = Server.connection.cfg.haproxy.enabled
+            ? Server.create_smtps_server(opts, onConnect)
+            : tls.createServer(opts, onConnect)
+        const tls_event_server = server.tlsServer || server
+        tls_socket.addOCSP(tls_event_server)
         server.has_tls = true
-        server.on('resumeSession', (id, rsDone) => {
+        tls_event_server.on('resumeSession', (id, rsDone) => {
             Server.loginfo('client requested TLS resumeSession')
             rsDone(null, null)
         })

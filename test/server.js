@@ -4,13 +4,32 @@ const { describe, it, beforeEach, afterEach } = require('node:test')
 const assert = require('node:assert/strict')
 const { createHmac } = require('node:crypto')
 const net = require('node:net')
+const { once } = require('node:events')
 const path = require('node:path')
 const tls = require('node:tls')
 const constants = require('haraka-constants')
+const net_utils = require('haraka-net-utils')
 
 const endpoint = require('../endpoint')
 const message = require('haraka-email-message')
 const { get_client } = require('../smtp_client')
+
+function fixtureConfig(name) {
+    const testRoot = path.resolve('test')
+    return require('haraka-config').module_config(testRoot, path.resolve('test/fixtures', name))
+}
+
+function useHaproxyFixture(server, name) {
+    const originalConfig = net_utils.config
+    const originalConnectionCfg = server.connection.cfg
+    const config = fixtureConfig(name)
+    net_utils.config = config
+    server.connection.cfg = config.get('connection.ini', { booleans: ['+haproxy.enabled'] })
+    return () => {
+        net_utils.config = originalConfig
+        server.connection.cfg = originalConnectionCfg
+    }
+}
 
 // ─── CRAM-MD5 helper ──────────────────────────────────────────────────────────
 
@@ -121,6 +140,35 @@ const sendMessage = ({
                     })
             },
             { host, port, connect_timeout: 5 },
+        )
+    })
+
+const listen = (server, host = '127.0.0.1') =>
+    new Promise((resolve, reject) => {
+        server.once('error', reject)
+        server.listen(0, host, () => {
+            server.removeListener('error', reject)
+            resolve()
+        })
+    })
+
+const close = (server) =>
+    new Promise((resolve) => {
+        server.close(resolve)
+    })
+
+const withTimeout = (promise, ms, msg) =>
+    new Promise((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(msg)), ms)
+        promise.then(
+            (result) => {
+                clearTimeout(timer)
+                resolve(result)
+            },
+            (err) => {
+                clearTimeout(timer)
+                reject(err)
+            },
         )
     })
 
@@ -240,6 +288,382 @@ describe('server', () => {
             assert.equal(server.has_tls, true)
             const count = await new Promise((res) => server.getConnections((err, n) => res(n)))
             assert.equal(count, 0)
+        })
+
+        it('accepts PROXY v1 before the SMTPS TLS handshake', async () => {
+            const restoreHaproxyConfig = useHaproxyFixture(this.server, 'haproxy_allowed')
+            this.server.cfg.main.smtps_port = 0
+
+            // PROXY-before-TLS takes slightly longer than the default 10 ms timeout on Windows,
+            // use 50 ms timeout to avoid flaky tests (default is 300000 ms).
+            const server = await this.server.get_smtp_server(endpoint('127.0.0.1:0'), 50)
+            const tlsErrors = []
+            let raw
+            let client
+
+            server.on('tlsClientError', (err) => {
+                tlsErrors.push(err)
+            })
+
+            try {
+                await listen(server)
+
+                raw = net.connect(server.address().port, '127.0.0.1')
+                await withTimeout(
+                    Promise.race([
+                        once(raw, 'connect'),
+                        once(raw, 'error').then(([err]) => {
+                            throw err
+                        }),
+                    ]),
+                    3000,
+                    'SMTPS TCP connection timed out',
+                )
+
+                raw.write('PROXY TCP4 127.0.0.1 127.0.0.1 42310 465\r\n')
+                client = tls.connect({
+                    socket: raw,
+                    rejectUnauthorized: false,
+                    servername: 'localhost',
+                })
+
+                await withTimeout(
+                    Promise.race([
+                        once(client, 'secureConnect'),
+                        once(client, 'error').then(([err]) => {
+                            throw err
+                        }),
+                    ]),
+                    3000,
+                    'SMTPS PROXY handshake timed out',
+                )
+                const [banner] = await withTimeout(once(client, 'data'), 3000, 'SMTPS PROXY banner timed out')
+                assert.match(banner.toString(), /^220 /)
+                assert.equal(tlsErrors.length, 0)
+            } finally {
+                if (client) client.destroy()
+                else if (raw) raw.destroy()
+                await close(server)
+                restoreHaproxyConfig()
+            }
+        })
+
+        it('accepts direct SMTPS from a PROXY-allowed peer', async () => {
+            const restoreHaproxyConfig = useHaproxyFixture(this.server, 'haproxy_allowed')
+            this.server.cfg.main.smtps_port = 0
+
+            const server = await this.server.get_smtp_server(endpoint('127.0.0.1:0'), 10)
+            const tlsErrors = []
+            let client
+
+            server.on('tlsClientError', (err) => {
+                tlsErrors.push(err)
+            })
+
+            try {
+                await listen(server)
+
+                client = tls.connect({
+                    port: server.address().port,
+                    host: '127.0.0.1',
+                    rejectUnauthorized: false,
+                    servername: 'localhost',
+                })
+
+                await withTimeout(
+                    Promise.race([
+                        once(client, 'secureConnect'),
+                        once(client, 'error').then(([err]) => {
+                            throw err
+                        }),
+                    ]),
+                    3000,
+                    'direct SMTPS handshake timed out',
+                )
+                const [banner] = await withTimeout(once(client, 'data'), 3000, 'direct SMTPS banner timed out')
+                assert.match(banner.toString(), /^220 /)
+                assert.equal(tlsErrors.length, 0)
+            } finally {
+                if (client) client.destroy()
+                await close(server)
+                restoreHaproxyConfig()
+            }
+        })
+
+        it('preserves TLS server events for SMTPS connections', async () => {
+            this.server.cfg.main.smtps_port = 0
+
+            const server = await this.server.get_smtp_server(endpoint('127.0.0.1:0'), 10)
+            let ocspRequests = 0
+            let first
+            let second
+
+            server.tlsServer.on('OCSPRequest', (cert, issuer, cb) => {
+                ocspRequests++
+                cb()
+            })
+
+            try {
+                await listen(server)
+
+                first = tls.connect({
+                    port: server.address().port,
+                    host: '127.0.0.1',
+                    rejectUnauthorized: false,
+                    requestOCSP: true,
+                    servername: 'localhost',
+                    maxVersion: 'TLSv1.2',
+                })
+
+                await withTimeout(
+                    Promise.race([
+                        once(first, 'secureConnect'),
+                        once(first, 'error').then(([err]) => {
+                            throw err
+                        }),
+                    ]),
+                    3000,
+                    'first SMTPS handshake timed out',
+                )
+                const session = first.getSession()
+                first.destroy()
+                await withTimeout(once(first, 'close'), 3000, 'first SMTPS close timed out')
+
+                second = tls.connect({
+                    port: server.address().port,
+                    host: '127.0.0.1',
+                    rejectUnauthorized: false,
+                    requestOCSP: true,
+                    servername: 'localhost',
+                    maxVersion: 'TLSv1.2',
+                    session,
+                })
+
+                await withTimeout(
+                    Promise.race([
+                        once(second, 'secureConnect'),
+                        once(second, 'error').then(([err]) => {
+                            throw err
+                        }),
+                    ]),
+                    3000,
+                    'resumed SMTPS handshake timed out',
+                )
+
+                assert.equal(ocspRequests, 1)
+                assert.equal(second.isSessionReused(), true)
+            } finally {
+                if (second) second.destroy()
+                if (first) first.destroy()
+                await close(server)
+            }
+        })
+
+        it('uses direct TLS for SMTPS when HAProxy support is disabled', async () => {
+            const restoreHaproxyConfig = useHaproxyFixture(this.server, 'haproxy_disabled')
+            this.server.cfg.main.smtps_port = 0
+
+            let server
+            let client
+
+            try {
+                server = await this.server.get_smtp_server(endpoint('127.0.0.1:0'), 10)
+                assert.equal(server.tlsServer, undefined)
+
+                await listen(server)
+
+                client = tls.connect({
+                    port: server.address().port,
+                    host: '127.0.0.1',
+                    rejectUnauthorized: false,
+                    servername: 'localhost',
+                })
+
+                await withTimeout(
+                    Promise.race([
+                        once(client, 'secureConnect'),
+                        once(client, 'error').then(([err]) => {
+                            throw err
+                        }),
+                    ]),
+                    3000,
+                    'direct TLS fallback handshake timed out',
+                )
+            } finally {
+                if (client) client.destroy()
+                if (server) await close(server)
+                restoreHaproxyConfig()
+            }
+        })
+
+        it('accepts direct SMTPS from an untrusted PROXY peer', async () => {
+            const restoreHaproxyConfig = useHaproxyFixture(this.server, 'haproxy_untrusted')
+            this.server.cfg.main.smtps_port = 0
+
+            const server = await this.server.get_smtp_server(endpoint('127.0.0.1:0'), 10)
+            let client
+
+            try {
+                await listen(server)
+
+                client = tls.connect({
+                    port: server.address().port,
+                    host: '127.0.0.1',
+                    rejectUnauthorized: false,
+                    servername: 'localhost',
+                })
+
+                await withTimeout(
+                    Promise.race([
+                        once(client, 'secureConnect'),
+                        once(client, 'error').then(([err]) => {
+                            throw err
+                        }),
+                    ]),
+                    3000,
+                    'untrusted direct SMTPS handshake timed out',
+                )
+            } finally {
+                if (client) client.destroy()
+                await close(server)
+                restoreHaproxyConfig()
+            }
+        })
+
+        it('rejects malformed SMTPS PROXY lines before TLS', async () => {
+            const restoreHaproxyConfig = useHaproxyFixture(this.server, 'haproxy_allowed')
+            this.server.cfg.main.smtps_port = 0
+
+            const server = await this.server.get_smtp_server(endpoint('127.0.0.1:0'), 10)
+            let raw
+
+            try {
+                await listen(server)
+
+                raw = net.connect(server.address().port, '127.0.0.1')
+                await withTimeout(once(raw, 'connect'), 3000, 'malformed PROXY TCP connection timed out')
+                raw.write('PROXY TCP4 nope 127.0.0.1 42310 465\r\n')
+
+                const [response] = await withTimeout(once(raw, 'data'), 3000, 'malformed PROXY response timed out')
+                assert.match(response.toString(), /^421 Invalid PROXY format/)
+            } finally {
+                if (raw) raw.destroy()
+                await close(server)
+                restoreHaproxyConfig()
+            }
+        })
+
+        it('rejects oversized SMTPS PROXY lines before TLS', async () => {
+            const restoreHaproxyConfig = useHaproxyFixture(this.server, 'haproxy_allowed')
+            this.server.cfg.main.smtps_port = 0
+
+            const server = await this.server.get_smtp_server(endpoint('127.0.0.1:0'), 10)
+            let raw
+
+            try {
+                await listen(server)
+
+                raw = net.connect(server.address().port, '127.0.0.1')
+                await withTimeout(once(raw, 'connect'), 3000, 'oversized PROXY TCP connection timed out')
+                raw.write(`PROXY ${'x'.repeat(513)}`)
+
+                const [response] = await withTimeout(once(raw, 'data'), 3000, 'oversized PROXY response timed out')
+                assert.match(response.toString(), /^421 Invalid PROXY format/)
+            } finally {
+                if (raw) raw.destroy()
+                await close(server)
+                restoreHaproxyConfig()
+            }
+        })
+
+        it('times out waiting for SMTPS PROXY from an allowed peer', async () => {
+            const restoreHaproxyConfig = useHaproxyFixture(this.server, 'haproxy_allowed')
+            const originalSetTimeout = global.setTimeout
+            global.setTimeout = (fn, ms, ...args) => originalSetTimeout(fn, ms === 30 * 1000 ? 20 : ms, ...args)
+            this.server.cfg.main.smtps_port = 0
+
+            const server = await this.server.get_smtp_server(endpoint('127.0.0.1:0'), 10)
+            let raw
+
+            try {
+                await listen(server)
+
+                raw = net.connect(server.address().port, '127.0.0.1')
+                await withTimeout(once(raw, 'connect'), 3000, 'PROXY timeout TCP connection timed out')
+
+                const [response] = await withTimeout(once(raw, 'data'), 3000, 'PROXY timeout response timed out')
+                assert.match(response.toString(), /^421 PROXY timeout/)
+            } finally {
+                global.setTimeout = originalSetTimeout
+                if (raw) raw.destroy()
+                await close(server)
+                restoreHaproxyConfig()
+            }
+        })
+
+        it('accepts byte-by-byte direct SMTPS from a PROXY-allowed peer', async () => {
+            const restoreHaproxyConfig = useHaproxyFixture(this.server, 'haproxy_allowed')
+            this.server.cfg.main.smtps_port = 0
+
+            const server = await this.server.get_smtp_server(endpoint('127.0.0.1:0'), 10)
+            let raw
+            let client
+
+            try {
+                await listen(server)
+
+                raw = net.connect(server.address().port, '127.0.0.1')
+                await withTimeout(once(raw, 'connect'), 3000, 'fragmented direct SMTPS TCP connection timed out')
+
+                const write = raw.write.bind(raw)
+                raw.write = (chunk, encoding, cb) => {
+                    if (typeof encoding === 'function') {
+                        cb = encoding
+                        encoding = undefined
+                    }
+                    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, encoding)
+                    let pos = 0
+                    const write_next = () => {
+                        if (pos >= buffer.length) {
+                            if (cb) cb()
+                            return
+                        }
+                        write(buffer.subarray(pos, pos + 1))
+                        pos++
+                        setImmediate(write_next)
+                    }
+                    write_next()
+                    return true
+                }
+
+                client = tls.connect({
+                    socket: raw,
+                    rejectUnauthorized: false,
+                    servername: 'localhost',
+                })
+
+                await withTimeout(
+                    Promise.race([
+                        once(client, 'secureConnect'),
+                        once(client, 'error').then(([err]) => {
+                            throw err
+                        }),
+                    ]),
+                    3000,
+                    'fragmented direct SMTPS handshake timed out',
+                )
+                const [banner] = await withTimeout(
+                    once(client, 'data'),
+                    3000,
+                    'fragmented direct SMTPS banner timed out',
+                )
+                assert.match(banner.toString(), /^220 /)
+            } finally {
+                if (client) client.destroy()
+                else if (raw) raw.destroy()
+                await close(server)
+                restoreHaproxyConfig()
+            }
         })
     })
 
