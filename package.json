@@ -1,6 +1,6 @@
 {
-  "author": "Matt Sergeant <helpme@gmail.com> (http://baudehlo.com/)",
-  "name": "Haraka",
+  "author": "Matt Sergeant <helpme@gmail.com>",
+  "name": "haraka",
   "license": "MIT",
   "description": "An SMTP Server project.",
   "keywords": [
@@ -70,15 +70,16 @@
   "devDependencies": {
     "@haraka/eslint-config": "~3.0.0",
     "haraka-test-fixtures": "^1.7.1",
-    "mock-require": "~3.0.3"
+    "mock-require": "~3.0.3",
+    "toobusy-js": "^0.5.1"
   },
   "bugs": {
     "mail": "haraka.mail@gmail.com",
     "url": "https://github.com/haraka/Haraka/issues"
   },
   "bin": {
-    "haraka": "./bin/haraka",
-    "haraka_grep": "./bin/haraka_grep"
+    "haraka": "bin/haraka",
+    "haraka_grep": "bin/haraka_grep"
   },
   "scripts": {
     "prepare": "git rev-parse --git-dir >/dev/null 2>&1 && git config core.hooksPath .githooks || true",
