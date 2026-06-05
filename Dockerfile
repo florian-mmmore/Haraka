@@ -35,7 +35,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get -y -q install nodejs && \
 
 # Install Haraka
 RUN npm install -g Haraka --unsafe
-RUN haraka -i /usr/local/haraka
+RUN haraka -i /usr/local/haraka && echo "mail.more.marketing" > /usr/local/haraka/config/me
 ADD ./config/host_list /usr/local/haraka/config/host_list
 ADD ./config/plugins /usr/local/haraka/config/plugins
 ADD ./config/smtp.ini /usr/local/haraka/config/smtp.ini
